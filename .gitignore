@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Build do executavel
+build/
+dist/
+
+# Dados locais — NUNCA versionar (documentos reais de pacientes)
+*.pdf
+SEMANA*/
+Nova pasta/
+_preview/
