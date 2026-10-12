@@ -14,6 +14,7 @@ Token do GitHub: variavel GITHUB_TOKEN ou a URL do remote origin
 (https://<token>@github.com/...). Nunca e salvo em arquivo.
 """
 import argparse
+import glob
 import json
 import os
 import re
@@ -24,6 +25,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).parent
 INIT_FILE = ROOT / "app" / "__init__.py"
+VERSION_FILE = ROOT / "version_info.txt"
 SPEC = ROOT / "ConversorPDF.spec"
 EXE = ROOT / "dist" / "ConversorPDF.exe"
 REPO = "dihgomes/conversor_pdf"
@@ -54,6 +56,18 @@ def bump_version(version: str) -> None:
     INIT_FILE.write_text(
         f'__version__ = "{version}"\n', encoding="utf-8"
     )
+    # Mantem o version resource do exe na mesma versao
+    parts = (version.split(".") + ["0", "0", "0"])[:4]
+    ver4 = ", ".join(parts)
+    txt = VERSION_FILE.read_text("utf-8")
+    txt = re.sub(r"filevers=\([^)]*\)", f"filevers=({ver4})", txt)
+    txt = re.sub(r"prodvers=\([^)]*\)", f"prodvers=({ver4})", txt)
+    txt = re.sub(
+        r"('(?:FileVersion|ProductVersion)', ')[^']*",
+        lambda m: m.group(1) + version,
+        txt,
+    )
+    VERSION_FILE.write_text(txt, encoding="utf-8")
 
 
 def get_token() -> str:
@@ -112,6 +126,35 @@ def get_release_by_tag(tag: str, token: str) -> dict | None:
         if exc.code == 404:
             return None
         raise
+
+
+def find_signtool() -> str | None:
+    kits = glob.glob(
+        r"C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe"
+    )
+    return sorted(kits)[-1] if kits else None
+
+
+def sign_exe() -> None:
+    """Assina o exe se houver certificado .pfx configurado via
+    SIGN_PFX (+SIGN_PFX_PASSWORD). Sem certificado, apenas avisa —
+    o campo "Editor" do SmartScreen so aparece com certificado valido."""
+    pfx = os.environ.get("SIGN_PFX")
+    if not pfx:
+        print("sem certificado (SIGN_PFX) — exe nao assinado")
+        return
+    signtool = find_signtool()
+    if not signtool:
+        print("signtool nao encontrado — instale o Windows SDK")
+        return
+    run([
+        signtool, "sign", "/fd", "SHA256",
+        "/f", pfx,
+        "/p", os.environ.get("SIGN_PFX_PASSWORD", ""),
+        "/tr", "http://timestamp.digicert.com", "/td", "SHA256",
+        str(EXE),
+    ])
+    print("exe assinado")
 
 
 def publish_release(version: str, token: str, notes: str) -> None:
@@ -185,6 +228,7 @@ def main() -> None:
         ])
     if not EXE.exists():
         sys.exit(f"{EXE} nao existe — rode o build ou ajuste o spec")
+    sign_exe()
 
     if not args.no_commit:
         run(["git", "add", "-A"])
