@@ -6,8 +6,11 @@ from PySide6.QtCore import (
     QSettings,
     QSize,
     Qt,
+    QThreadPool,
+    QTimer,
+    QUrl,
 )
-from PySide6.QtGui import QColor
+from PySide6.QtGui import QColor, QDesktopServices
 from PySide6.QtWidgets import (
     QButtonGroup,
     QHBoxLayout,
@@ -24,6 +27,7 @@ from PySide6.QtWidgets import (
 )
 
 from app import __version__
+from app.core import updates
 from app.registry import TOOLS
 from app.ui import theme
 from app.ui.pages.batch_page import BatchPage
@@ -36,6 +40,7 @@ from app.ui.pages.settings_page import (
     SettingsPage,
 )
 from app.ui.pages.tool_page import ToolPage
+from app.workers.worker import Worker
 
 # Ferramentas com tela propria (fora do modelo generico ToolPage).
 PAGE_OVERRIDES = {"organize": OrganizePage, "lote_ortopedia": BatchPage}
@@ -359,6 +364,9 @@ class MainWindow(QMainWindow):
         if QSystemTrayIcon.isSystemTrayAvailable():
             self._tray.show()
 
+        # Checagem de atualizacao em background, depois da janela abrir
+        QTimer.singleShot(3000, self._check_updates)
+
     def notify(self, title: str, message: str) -> None:
         """Notificacao do Windows (toast); se a bandeja nao estiver
         disponivel, cai num popup NAO-modal (um QMessageBox modal
@@ -375,6 +383,41 @@ class MainWindow(QMainWindow):
             box.setIcon(QMessageBox.Icon.Information)
             box.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
             box.show()
+
+    # ----------------------------------------------------- atualizacao
+
+    def _check_updates(self) -> None:
+        """Consulta o GitHub em background; nunca trava a UI nem mostra
+        erro — sem internet/repo privado simplesmente nao avisa."""
+        worker = Worker(updates.check_for_update)
+        worker.signals.finished.connect(self._on_update_check)
+        QThreadPool.globalInstance().start(worker)
+
+    def _on_update_check(self, remote: str | None) -> None:
+        """Versao mais nova no GitHub: toast do Windows + popup
+        nao-modal com botao para a pagina de releases."""
+        if not remote:
+            return
+        msg = (
+            f"Versao V.{remote} disponivel "
+            f"(voce esta na V.{__version__})."
+        )
+        self.notify("Atualizacao disponivel", msg)
+        box = QMessageBox(self)
+        box.setWindowTitle("Atualizacao disponivel")
+        box.setText(
+            msg + "\n\nBaixe a versao mais recente na pagina do projeto."
+        )
+        box.setIcon(QMessageBox.Icon.Information)
+        open_btn = box.addButton(
+            "Abrir pagina", QMessageBox.ButtonRole.AcceptRole
+        )
+        box.addButton(QMessageBox.StandardButton.Ok)
+        open_btn.clicked.connect(
+            lambda: QDesktopServices.openUrl(QUrl(updates.RELEASES_URL))
+        )
+        box.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        box.show()  # nao-modal: nao bloqueia o app
 
     # -------------------------------------------------------- navegacao
 
