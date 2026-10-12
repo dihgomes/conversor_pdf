@@ -1,7 +1,10 @@
 """Janela principal: sidebar retratil + paginas empilhadas."""
+from datetime import datetime
+
 import qtawesome as qta
 from PySide6.QtCore import (
     QEasingCurve,
+    QPoint,
     QPropertyAnimation,
     QSettings,
     QSize,
@@ -13,12 +16,14 @@ from PySide6.QtCore import (
 from PySide6.QtGui import QColor, QDesktopServices
 from PySide6.QtWidgets import (
     QButtonGroup,
+    QFrame,
     QHBoxLayout,
     QLabel,
     QListWidget,
     QListWidgetItem,
     QMainWindow,
     QMessageBox,
+    QPushButton,
     QStackedWidget,
     QSystemTrayIcon,
     QToolButton,
@@ -68,6 +73,12 @@ QListWidget#Sidebar::item:hover:!selected {{ background: {theme.SIDEBAR_HOVER};
 #SidebarLogo {{ color: #ffffff; font-size: 13px; font-weight: 700; }}
 #SidebarFooter {{ color: {theme.SIDEBAR_SECTION}; font-size: 10px;
     padding: 8px; }}
+#BellBadge {{ background: #dc2626; color: #ffffff; border-radius: 7px;
+    font-size: 9px; font-weight: 700; }}
+#BellPopup {{ background: {theme.SURFACE}; color: {theme.TEXT};
+    border: 1px solid {theme.BORDER}; border-radius: 8px; }}
+#BellPopupEmpty {{ color: {theme.TEXT_FAINT}; font-size: 12px;
+    padding: 12px; }}
 QToolButton {{ background: transparent; border: none; border-radius: 6px; }}
 QToolButton:hover {{ background: {theme.SIDEBAR_HOVER}; }}
 QToolButton:checked {{ background: {theme.PRIMARY}; }}
@@ -153,6 +164,12 @@ class MainWindow(QMainWindow):
             theme.set_mode("dark")
         self.setStyleSheet(build_style())
 
+        # Historico do sino: o toast do Windows some sozinho, entao os
+        # avisos ficam guardados aqui para consulta depois.
+        self._notifications: list[tuple[str, str]] = []  # (hora, texto)
+        self._unread = 0
+        self._bells: list[tuple[QToolButton, QLabel]] = []
+
         # ---------- paginas ----------
         self.stack = QStackedWidget()
         self.home = HomePage()
@@ -184,11 +201,14 @@ class MainWindow(QMainWindow):
         collapse_btn = self._icon_button("fa5s.bars", "Recolher menu")
         collapse_btn.clicked.connect(self._toggle_sidebar)
 
+        self.bell = self._make_bell()
+
         self.brand = QWidget()
         brand_row = QHBoxLayout(self.brand)
         brand_row.setContentsMargins(16, 12, 10, 12)
         brand_row.setSpacing(10)
         brand_row.addWidget(logo_text, 1)
+        brand_row.addWidget(self.bell)
         brand_row.addWidget(collapse_btn)
 
         self.sidebar = QListWidget()
@@ -326,6 +346,12 @@ class MainWindow(QMainWindow):
             self._rail_btns[stack_index] = btn
             rail_layout.addWidget(btn)
 
+        # Sino tambem no rail (sidebar recolhida nao mostra a brand)
+        bell_rail = self._make_bell()
+        bell_rail.setFixedSize(40, 38)
+        bell_rail.setIconSize(QSize(17, 17))
+        rail_layout.addWidget(bell_rail)
+
         self.rail.setVisible(False)
 
         # ---------- monta a sidebar ----------
@@ -377,10 +403,72 @@ class MainWindow(QMainWindow):
         # Checagem de atualizacao em background, depois da janela abrir
         QTimer.singleShot(3000, self._check_updates)
 
+    # -------------------------------------------------- notificacoes
+
+    def _make_bell(self) -> QToolButton:
+        """Cria um botao-sino com badge de nao lidas sobre o icone."""
+        btn = self._icon_button("fa5s.bell", "Notificacoes")
+        btn.clicked.connect(self._show_notifications)
+        badge = QLabel(btn)
+        badge.setObjectName("BellBadge")
+        badge.setFixedSize(15, 15)
+        badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        badge.setVisible(False)
+        self._bells.append((btn, badge))
+        return btn
+
+    def _update_bell(self) -> None:
+        n = self._unread
+        for btn, badge in self._bells:
+            badge.setText(str(n) if n <= 9 else "9+")
+            badge.setVisible(n > 0)
+            badge.move(btn.width() - 16, 2)
+
+    def _show_notifications(self) -> None:
+        """Popup ancorado no sino com o historico de avisos."""
+        popup = QFrame(self, Qt.WindowType.Popup)
+        popup.setObjectName("BellPopup")
+        popup.setFixedWidth(340)
+        lay = QVBoxLayout(popup)
+        lay.setContentsMargins(14, 10, 14, 10)
+        lay.setSpacing(6)
+        if not self._notifications:
+            empty = QLabel("Nenhuma notificacao")
+            empty.setObjectName("BellPopupEmpty")
+            lay.addWidget(empty)
+        else:
+            for when, text in self._notifications[:20]:
+                row = QLabel(f"{when}  —  {text}")
+                row.setWordWrap(True)
+                lay.addWidget(row)
+            clear_btn = QPushButton("Limpar historico")
+            clear_btn.setObjectName("SecondaryButton")
+            clear_btn.clicked.connect(
+                lambda: (self._notifications.clear(), popup.close())
+            )
+            lay.addWidget(clear_btn)
+        src = self.sender()
+        if isinstance(src, QWidget):
+            popup.move(
+                src.mapToGlobal(QPoint(0, src.height() + 4))
+            )
+        self._unread = 0
+        self._update_bell()
+        popup.show()
+
     def notify(self, title: str, message: str) -> None:
-        """Notificacao do Windows (toast); se a bandeja nao estiver
-        disponivel, cai num popup NAO-modal (um QMessageBox modal
-        travaria a thread ate o usuario clicar)."""
+        """Notificacao do Windows (toast) + registro no sino. Se a
+        bandeja nao estiver disponivel, cai num popup NAO-modal
+        (um QMessageBox modal travaria a thread ate o usuario clicar)."""
+        self._notifications.insert(
+            0,
+            (
+                datetime.now().strftime("%H:%M"),
+                f"{title}: {message.splitlines()[0]}",
+            ),
+        )
+        self._unread += 1
+        self._update_bell()
         if self._tray.isVisible():
             self._tray.showMessage(
                 title, message,
