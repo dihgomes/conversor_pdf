@@ -85,8 +85,18 @@ QToolButton:checked {{ background: {theme.PRIMARY}; }}
 #DropZone {{ background: {theme.SURFACE}; border: 2px dashed {theme.THUMB_BORDER};
     border-radius: 10px; }}
 #DropZoneLabel {{ color: {theme.TEXT_FAINT}; font-size: 13px; }}
-#FileList {{ background: {theme.SURFACE}; color: {theme.TEXT};
+#FileList, #PageGrid {{ background: {theme.SURFACE}; color: {theme.TEXT};
     border: 1px solid {theme.BORDER}; border-radius: 8px; font-size: 12px; }}
+/* Selecao visivel em TODAS as listas de arquivos/paginas: borda +
+fundo verdes, e hover sutil. A marca vermelha de revisao do lote e
+desenhada na miniatura, entao nao e coberta por esse fundo. */
+#FileList::item, #PageGrid::item {{ border: 2px solid transparent;
+    border-radius: 6px; padding: 4px; }}
+#FileList::item:selected, #PageGrid::item:selected {{
+    border: 2px solid {theme.PRIMARY}; background: {theme.SELECTION_BG};
+    color: {theme.TEXT}; }}
+#FileList::item:hover:!selected, #PageGrid::item:hover:!selected {{
+    border: 2px solid {theme.SELECTION_HOVER}; }}
 #RangeInput {{ background: {theme.SURFACE}; color: {theme.TEXT};
     border: 1px solid {theme.BORDER}; border-radius: 6px;
     padding: 8px 10px; font-size: 12px; }}
@@ -460,15 +470,10 @@ class MainWindow(QMainWindow):
         self._go_to(0)
 
     def _apply_theme(self, dark: bool) -> None:
-        """Vem de Configuracoes: troca a paleta e remonta os estilos
-        em runtime (a folha global cobre quase tudo; a grade do
-        Organizar tem folha propria e se atualiza em refresh_theme)."""
+        """Vem de Configuracoes: troca a paleta e remonta a folha de
+        estilo global, que cobre todas as telas e listas."""
         theme.set_mode("dark" if dark else "light")
         self.setStyleSheet(build_style())
-        for page in self._tool_pages.values():
-            refresh = getattr(page, "refresh_theme", None)
-            if refresh:
-                refresh()
 
     def _on_nav(self, row: int) -> None:
         if row in self._row_to_stack:

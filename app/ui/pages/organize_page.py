@@ -32,7 +32,6 @@ from PySide6.QtWidgets import (
 
 from app.core import auto_sort
 from app.registry import PDF_FILTER, Tool
-from app.ui import theme
 from app.ui.widgets.drop_zone import DropZone
 from app.ui.widgets.preview import PreviewDialog
 from app.ui.widgets.thumbnails import page_pixmap, page_thumbnail
@@ -163,7 +162,6 @@ class OrganizePage(QWidget):
         self.pages.setSelectionMode(
             QAbstractItemView.SelectionMode.MultiSelection
         )
-        self.pages.setStyleSheet(self._grid_style())
         self.pages.setMovement(QListWidget.Movement.Snap)
         self.pages.setResizeMode(QListWidget.ResizeMode.Adjust)
         self.pages.setWrapping(True)
@@ -252,26 +250,6 @@ class OrganizePage(QWidget):
         layout.addWidget(self.editor, 1)
         layout.addWidget(self.status)
         layout.addWidget(self.open_btn, alignment=Qt.AlignmentFlag.AlignRight)
-
-    def _grid_style(self) -> str:
-        """Folha de estilo da grade — montada na hora para acompanhar
-        a troca de tema claro/escuro."""
-        return f"""
-            QListWidget#PageGrid {{ background: {theme.SURFACE};
-                color: {theme.TEXT}; border: 1px solid {theme.BORDER};
-                border-radius: 8px; }}
-            QListWidget#PageGrid::item {{ border: 2px solid transparent;
-                border-radius: 6px; padding: 4px; }}
-            QListWidget#PageGrid::item:selected {{
-                border: 2px solid {theme.PRIMARY};
-                background: {theme.SELECTION_BG}; color: {theme.TEXT}; }}
-            QListWidget#PageGrid::item:hover:!selected {{
-                border: 2px solid {theme.SELECTION_HOVER}; }}
-        """
-
-    def refresh_theme(self) -> None:
-        """Reaplica a folha da grade quando o tema muda em runtime."""
-        self.pages.setStyleSheet(self._grid_style())
 
     # ---------------------------------------------------- arrastar/soltar
 

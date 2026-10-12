@@ -49,6 +49,11 @@ class ToolPage(QWidget):
 
         self.file_list = QListWidget()
         self.file_list.setObjectName("FileList")
+        # Clique simples alterna a selecao (sem Ctrl), igual a grade do
+        # Organizar.
+        self.file_list.setSelectionMode(
+            QAbstractItemView.SelectionMode.MultiSelection
+        )
         self.file_list.setDragDropMode(QAbstractItemView.DragDropMode.NoDragDrop)
         self.file_list.viewport().setAcceptDrops(False)
         self.file_list.setViewMode(QListWidget.ViewMode.IconMode)

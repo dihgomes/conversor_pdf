@@ -11,6 +11,7 @@ import qtawesome as qta
 from PySide6.QtCore import QSettings, QSize, Qt, QThreadPool, QUrl, Signal
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QFileDialog,
     QHBoxLayout,
     QLabel,
@@ -98,6 +99,9 @@ class BatchPage(QWidget):
         # Uma linha por pasta de paciente; o icone mostra o status.
         self.folder_list = QListWidget()
         self.folder_list.setObjectName("FileList")
+        self.folder_list.setSelectionMode(
+            QAbstractItemView.SelectionMode.MultiSelection
+        )
 
         self.progress = QProgressBar()
         self.progress.setVisible(False)
