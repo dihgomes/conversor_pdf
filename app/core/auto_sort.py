@@ -257,6 +257,60 @@ def _has_big_x(arr: np.ndarray) -> bool:
     )
 
 
+def _has_color_mark(arr: np.ndarray) -> bool:
+    """Detecta marcacao de anulacao com caneta colorida que NAO e X:
+    ovais, circulos e elipses desenhados sobre campos ou a pagina.
+
+    Tres propriedades de uma marcacao a caneta separam isso de ruido:
+    tinta saturada (a mesma mascara do caminho 1 de _has_big_x),
+    formato FECHADO grande (perimetro e area minimos) e anel FINO
+    (interior quase vazio). Isso deixa de fora carimbos (interior
+    denso de texto), sublinhados (razao de aspecto de linha) e
+    documentos coloridos inteiros (teto de cobertura de 15%).
+    """
+    import cv2
+
+    h, w = arr.shape[:2]
+    m = min(h, w)
+    hsv = cv2.cvtColor(arr, cv2.COLOR_RGB2HSV)
+    ink = ((hsv[:, :, 1] > 30) & (hsv[:, :, 2] > 40)).astype(
+        np.uint8
+    ) * 255
+    if (ink > 0).mean() > 0.15:
+        return False  # documento colorido inteiro (CNH etc.)
+
+    ink = cv2.morphologyEx(
+        ink,
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9)),
+    )
+    contours, _ = cv2.findContours(
+        ink, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
+    for c in contours:
+        x, y, cw, ch = cv2.boundingRect(c)
+        extent = (cw * ch) / (w * h)
+        if extent < 0.02:
+            continue  # marca pequena (check, rubrica)
+        if extent > 0.20:
+            continue  # estrutura do documento (tabela, moldura)
+        if min(cw, ch) / max(cw, ch) < 0.15:
+            continue  # linha/sublinhado — aberto, nao fechado
+        if cv2.arcLength(c, True) < 1.2 * m:
+            continue  # percurso curto demais
+        inner = (ink[y : y + ch, x : x + cw] > 0).mean()
+        if inner > 0.18:
+            continue  # interior cheio: carimbo/realce, nao anel
+        # Solidez (area do contorno / hull convexo): um oval fechado
+        # cobre quase todo o hull (~0,5+); assinatura e rabisco sao
+        # esparsos dentro do proprio contorno (~0,2).
+        hull = cv2.convexHull(c)
+        if cv2.contourArea(c) / max(cv2.contourArea(hull), 1) < 0.40:
+            continue
+        return True
+    return False
+
+
 def _ocr_page(page: pymupdf.Page) -> tuple[str, float, bool]:
     """Renderiza a pagina, mede a fracao escura, detecta anulacao (X)
     e roda OCR. Retorna (texto_ocr, dark_ratio, anulada).
@@ -276,7 +330,7 @@ def _ocr_page(page: pymupdf.Page) -> tuple[str, float, bool]:
 
     arr = render(0)
     dark = float((arr.mean(axis=2) < 100).mean())
-    cancelled = _has_big_x(arr)
+    cancelled = _has_big_x(arr) or _has_color_mark(arr)
     if dark >= 0.5:
         return "", dark, cancelled
 
@@ -377,8 +431,21 @@ def _scan(
                 continue
             if len(text.strip()) >= 200:
                 raw_texts[key] = text
-                darks[key] = 0.0
-                annulled[key] = False
+                # pagina com camada de texto pula o OCR, mas a marca
+                # de anulacao e VISUAL (desenho sobre o scan) — ainda
+                # precisa renderizar e passar pelos detectores
+                try:
+                    pix = page.get_pixmap(
+                        matrix=pymupdf.Matrix(1.5, 1.5), alpha=False
+                    )
+                    arr = np.frombuffer(
+                        pix.samples, dtype=np.uint8
+                    ).reshape(pix.height, pix.width, pix.n)
+                    darks[key] = float((arr.mean(axis=2) < 100).mean())
+                    annulled[key] = _has_big_x(arr) or _has_color_mark(arr)
+                except Exception:  # noqa: BLE001
+                    darks[key] = 0.0
+                    annulled[key] = False
                 continue
             cache_key = sig + (i,)
             cached = _OCR_CACHE.get(cache_key)
@@ -485,7 +552,7 @@ def suggest_order(docs: list[pymupdf.Document]) -> list[tuple[int, int]]:
 # ("CNE-S-REGULAGAO" → SR falso) e o nome precisa comecar em maiuscula —
 # assim prosa como "o paciente recebeu..." nao gera candidato.
 _NAME_RAW_RE = re.compile(
-    r"\b(?i:paciente|benefici[aá]rio|sra?|sr\W*a?)"
+    r"\b(?i:paciente|benefici[aá]rio|cliente|sra?|sr\W*a?)"
     r"[^A-Za-zÀ-ÿ0-9]{0,10}"
     r"([A-ZÀ-Ý][A-ZÀ-Ý'\-]*(?:\s+[A-ZÀ-Ý][A-ZÀ-Ý'\-]*){0,6})"
 )
@@ -532,6 +599,36 @@ def _trim_name(run: str) -> str:
         if 0 < pos < cut:
             cut = pos
     return run[:cut]
+
+
+def _divergent_names(raw: str, ref_norm: str | None) -> list[str]:
+    """Nomes ligados a rotulos de paciente ("PACIENTE X", "Sr(a), X")
+    que NAO sao a referencia — candidatos a pagina de outro paciente."""
+    found: list[str] = []
+    for m in _NAME_RAW_RE.finditer(raw):
+        cand = _trim_name(_normalize(m.group(1)))
+        if (8 <= len(cand) <= 45 and cand not in found
+                and not any(r in cand for r in _NAME_REJECT)
+                and not _same_person(cand, ref_norm)):
+            found.append(cand)
+    return found
+
+
+def _reocr_page(page: pymupdf.Page, zoom: float = 2.0) -> str:
+    """Re-OCR em zoom alternado: o detector do RapidOCR as vezes
+    dropa a linha italica/sublinhada do nome em certos zooms
+    (guia SESAB, termos de consentimento)."""
+    try:
+        pix = page.get_pixmap(
+            matrix=pymupdf.Matrix(zoom, zoom), alpha=False
+        )
+        arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(
+            pix.height, pix.width, pix.n
+        )
+        result, _ = _ocr()(arr)
+        return " ".join(r[1] for r in result) if result else ""
+    except Exception:  # noqa: BLE001 - falha no retry nao e erro
+        return ""
 
 
 def _same_person(a: str, b: str) -> bool:
@@ -585,13 +682,25 @@ def audit_patient(
             # "Sr(a), X"). Suspeita so quando um nome divergente e
             # efetivamente encontrado — ausencia de nome (variantes de
             # formulario sem campo) vira "nao verificavel", nao alarme.
-            found = []
-            for m in _NAME_RAW_RE.finditer(raw_texts[key]):
-                cand = _trim_name(_normalize(m.group(1)))
-                if (8 <= len(cand) <= 45 and cand not in found
-                        and not any(r in cand for r in _NAME_REJECT)
-                        and not _same_person(cand, name_norm)):
-                    found.append(cand)
+            found = _divergent_names(raw_texts[key], name_norm)
+            if score < 0.5:
+                # Re-OCR em zooms alternados antes de julgar: cada
+                # scan responde a um zoom diferente (o detector do
+                # RapidOCR dropa a linha italica/sublinhada do nome).
+                # So paginas nao verificadas pagam esse custo, e para
+                # assim que a referencia aparece.
+                d, i = key
+                for zoom in (2.0, 2.5, 1.2):
+                    retry = _reocr_page(docs[d][i], zoom)
+                    if retry:
+                        raw_texts[key] = f"{raw_texts[key]} {retry}"
+                        norms[key] = _normalize(raw_texts[key])
+                        score = _name_match_score(norms[key], name)
+                        found = _divergent_names(
+                            raw_texts[key], name_norm
+                        )
+                    if score >= 0.5:
+                        break
             if found and score < 0.5:
                 # nome de paciente divergente E referencia ausente —
                 # so assim a pagina pode ser de outro paciente; com o
