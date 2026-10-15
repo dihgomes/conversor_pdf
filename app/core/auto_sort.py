@@ -746,6 +746,7 @@ _NAME_SKIP = {"raiox", "nfe", "doc_responsavel", "desconhecido", "anulado"}
 _FOLDER_NOISE = {
     "FALTA", "FALTANDO", "DANFE", "PLACA", "SEM", "USO", "MATERIAL",
     "RX", "PRE", "POS", "NAO", "TEM", "PENDENTE", "PENDENTES",
+    "FATURAMENTO", "ESPELHO",
 }
 
 
@@ -877,6 +878,27 @@ def audit_patient(
 
 # ------------------------------------------------------- modo em lote
 
+# Documentos cuja ausencia deve ser sinalizada no nome do dossie/pasta
+# — (classe interna, rotulo exibido) na ordem de exibicao.
+_REQUIRED_DOCS = [
+    ("guia", "GAI"),
+    ("laudo", "AIH"),
+    ("faturamento", "FATURAMENTO"),
+    ("nfe", "DANFE"),
+    ("espelho_aih", "ESPELHO AIH"),
+]
+
+
+def _strip_falta(name: str) -> str:
+    """Nome limpo da pasta/dossie: remove anotacoes de pendencia
+    anteriores — "(falta AIH)" geradas pelo app e rabiscos manuais
+    tipo "NOME falta danfe" — para nao duplicar na reexecucao."""
+    name = re.sub(r"\s*\(falta[^)]*\)", " ", name, flags=re.IGNORECASE)
+    name = re.sub(
+        r"\s+falta(?:ndo)?\b.*$", "", name, flags=re.IGNORECASE
+    )
+    return name.strip()
+
 
 def list_patient_folders(root: str | Path) -> list[tuple[Path, list[Path]]]:
     """Lista (pasta_do_paciente, pdfs) dentro da pasta raiz.
@@ -885,13 +907,21 @@ def list_patient_folders(root: str | Path) -> list[tuple[Path, list[Path]]]:
     eles seriam silenciosamente ignorados quando ha subpastas.
     """
     def pdfs_of(folder: Path) -> list[Path]:
-        # insumo real: exclui a saida <pasta>.pdf e restos .tmp.pdf —
-        # contavam como "arquivo" na UI e na estatistica do lote
+        # insumo real: exclui a saida <pasta>.pdf (com ou sem
+        # anotacao " (falta ...)") e restos .tmp.pdf — contavam como
+        # "arquivo" na UI e na estatistica do lote
+        base = _strip_falta(folder.name)
+
+        def is_output(p: Path) -> bool:
+            # cobre "NOME.pdf", "NOME (falta X).pdf" e a anotacao
+            # legada "NOME falta X.pdf" — todas sao dossies gerados
+            return _strip_falta(p.stem) == base
+
         return sorted(
             p for p in folder.iterdir()
             if p.suffix.lower() == ".pdf"
             and not p.name.endswith(".tmp.pdf")
-            and p.name != f"{folder.name}.pdf"
+            and not is_output(p)
         )
 
     root = Path(root)
@@ -917,10 +947,15 @@ def _is_valid_output(path: Path) -> bool:
 
 
 def process_folder(
-    folder: Path, pdfs: list[Path]
-) -> tuple[Path, int, list, list, list]:
+    folder: Path, pdfs: list[Path], rename_folder: bool = True
+) -> tuple[Path, int, list, list, list, list]:
     """Junta todos os PDFs da pasta, ordena pelo perfil, audita o nome
     do paciente e salva o dossie como <pasta>/<nome_da_pasta>.pdf.
+
+    Documentos obrigatorios ausentes (_REQUIRED_DOCS) viram anotacao
+    no nome do dossie E da pasta: "NOME (falta AIH, GAI)". Na proxima
+    execucao a anotacao e recalculada — documento adicionado some da
+    lista, e a pasta volta ao nome limpo quando nada falta.
 
     O save e atomico (arquivo .tmp.pdf + rename): se o app morrer no
     meio da escrita, sobra um .tmp.pdf descartavel em vez de um PDF
@@ -929,13 +964,13 @@ def process_folder(
     PDFs que nao abrem sao pulados e reportados — um arquivo corrompido
     nao pode derrubar a pasta inteira.
 
-    Retorna (saida, num_paginas, suspects, excluidas, ilegiveis) —
-    suspects com "pos" = a pagina no PDF final; excluidas = paginas
-    anuladas ({file, page}) fora do dossie; ilegiveis = nomes dos
-    arquivos que nao abriram.
+    Retorna (saida, num_paginas, suspects, excluidas, ilegiveis,
+    faltantes) — suspects com "pos" = a pagina no PDF final; excluidas
+    = paginas anuladas ({file, page}) fora do dossie; ilegiveis =
+    nomes dos arquivos que nao abriram; faltantes = rotulos dos docs
+    obrigatorios ausentes.
     """
-    output = folder / f"{folder.name}.pdf"
-    tmp = folder / f"{folder.name}.tmp.pdf"
+    base = _strip_falta(folder.name)
     docs: list[pymupdf.Document] = []
     src_paths: list[Path] = []
     suspects: list[dict] = []
@@ -943,8 +978,12 @@ def process_folder(
     skipped: list[str] = []
     try:
         for path in pdfs:
-            if path in (output, tmp):
-                continue  # nunca inclui saida/resto de execucao anterior
+            # nunca inclui resto .tmp nem um dossie gerado antes —
+            # mesmo com anotacao " (falta ...)" de rodada anterior
+            if path.name.endswith(".tmp.pdf") or _strip_falta(
+                path.stem
+            ) == base:
+                continue
             try:
                 docs.append(pymupdf.open(path))
             except Exception:  # noqa: BLE001 - pula e reporta ao fim
@@ -954,7 +993,8 @@ def process_folder(
         if not docs:
             raise ValueError("nenhum PDF legivel para processar")
         order = suggest_order(docs)
-        for (d, i), cls in classify_documents(docs).items():
+        classes = classify_documents(docs)
+        for (d, i), cls in classes.items():
             if cls == "anulado":
                 excluded.append({"file": src_paths[d].name, "page": i + 1})
         if not order:
@@ -964,6 +1004,10 @@ def process_folder(
             raise ValueError(
                 f"todas as {len(excluded)} pagina(s) estao anuladas"
             )
+        present = {c for c in classes.values() if c != "anulado"}
+        missing = [
+            label for cls, label in _REQUIRED_DOCS if cls not in present
+        ]
         audit = audit_patient(docs, ref_from_folder(folder.name))
         for s in audit["suspects"]:
             s = dict(s)
@@ -972,13 +1016,45 @@ def process_folder(
         with pymupdf.open() as out:
             for d, i in order:
                 out.insert_pdf(docs[d], from_page=i, to_page=i)
+            # fecha os insumos ANTES de mexer no disco — no Windows um
+            # handle aberto impede rename/delete do dossie antigo
+            for doc in docs:
+                doc.close()
+            docs.clear()
+
+            desired = (
+                f"{base} (falta {', '.join(missing)})"
+                if missing else base
+            )
+            output = folder / f"{desired}.pdf"
+            tmp = folder / f"{desired}.tmp.pdf"
             tmp.unlink(missing_ok=True)
             out.save(tmp, garbage=4, deflate=True)
-        os.replace(tmp, output)
+            os.replace(tmp, output)
+            # dossie com anotacao velha (falta diferente) nao pode
+            # sobrar — seria lido como insumo na proxima rodada
+            for p in folder.iterdir():
+                if (
+                    p.is_file()
+                    and p != output
+                    and p.suffix.lower() == ".pdf"
+                    and not p.name.endswith(".tmp.pdf")
+                    and _strip_falta(p.stem) == base
+                ):
+                    p.unlink(missing_ok=True)
+            if rename_folder and desired != folder.name:
+                try:
+                    new_folder = folder.with_name(desired)
+                    folder.rename(new_folder)
+                    folder, output = new_folder, new_folder / output.name
+                except OSError:
+                    # pasta bloqueada (Explorer aberto etc.) — o
+                    # dossie anotado ja sinaliza a pendencia
+                    pass
     finally:
         for doc in docs:
             doc.close()
-    return output, len(order), suspects, excluded, skipped
+    return output, len(order), suspects, excluded, skipped, missing
 
 
 def organize_batch(
@@ -1022,8 +1098,9 @@ def organize_batch(
         if progress:
             progress({**entry, "status": "start"})
         output = folder / f"{folder.name}.pdf"
-        # resto de um save interrompido — descarta antes de processar
-        (folder / f"{folder.name}.tmp.pdf").unlink(missing_ok=True)
+        # restos de saves interrompidos — descarta antes de processar
+        for t in folder.glob("*.tmp.pdf"):
+            t.unlink(missing_ok=True)
         if _is_valid_output(output):
             entry.update(status="skip", detail="ja organizado",
                          output=output.name)
@@ -1031,12 +1108,20 @@ def organize_batch(
             entry.update(status="skip", detail="sem arquivos PDF")
         else:
             try:
-                out, pages, suspects, excluded, skipped = process_folder(
-                    folder, pdfs
+                (
+                    out,
+                    pages,
+                    suspects,
+                    excluded,
+                    skipped,
+                    missing,
+                ) = process_folder(
+                    folder, pdfs, rename_folder=(folder != Path(root))
                 )
                 entry.update(status="ok", pages=pages, output=out.name,
+                             folder_path=str(out.parent),
                              suspects=suspects, excluded=excluded,
-                             skipped=skipped)
+                             skipped=skipped, missing=missing)
             except Exception as exc:  # noqa: BLE001 - segue para a proxima pasta
                 entry.update(status="error", detail=str(exc))
         results.append(entry)

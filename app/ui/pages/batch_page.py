@@ -234,12 +234,15 @@ class BatchPage(QWidget):
                     f"{len(excluded)} anulada(s) ignorada(s): {refs}"
                 )
             skipped = entry.get("skipped") or []
+            missing = entry.get("missing") or []
+            if missing:
+                parts.append("FALTA: " + ", ".join(missing))
             if skipped:
                 parts.append(
                     f"ATENCAO: {len(skipped)} arquivo(s) ilegivel(is): "
                     + ", ".join(skipped)
                 )
-            if suspects or skipped:
+            if suspects or skipped or missing:
                 item.setIcon(self._icon("alerta"))
             if suspects:
                 pags = ", ".join(str(s["pos"]) for s in suspects)
@@ -280,11 +283,15 @@ class BatchPage(QWidget):
         self.folder_list.setItemWidget(item, holder)
 
     def _request_review(self, entry: dict) -> None:
-        folder = self._folders.get(entry["folder"])
+        # a pasta pode ter sido renomeada com a anotacao " (falta ...)"
+        # — usa o caminho real retornado pelo processamento
+        folder = entry.get("folder_path") or self._folders.get(
+            entry["folder"]
+        )
         positions = [s["pos"] for s in entry.get("suspects") or ()]
         if folder and positions:
             self.review_requested.emit(
-                str(folder / entry["output"]), positions
+                str(Path(folder) / entry["output"]), positions
             )
 
     def _on_finished(self, results: list) -> None:
@@ -320,12 +327,21 @@ class BatchPage(QWidget):
             f"• {r['folder']} — {r['detail']}"
             for r in results if r["status"] == "error"
         ]
-        if linhas_alerta or erros:
+        faltas = [
+            f"• {r['folder']} — falta {', '.join(r['missing'])}"
+            for r in results if r.get("missing")
+        ]
+        if linhas_alerta or erros or faltas:
             corpo = resumo + "\n\n"
             if linhas_alerta:
                 corpo += (
                     "Paginas que podem pertencer a outro paciente:\n"
                     + "\n".join(linhas_alerta) + "\n\n"
+                )
+            if faltas:
+                corpo += (
+                    "Documentos obrigatorios ausentes:\n"
+                    + "\n".join(faltas) + "\n\n"
                 )
             if erros:
                 corpo += "Pastas com erro:\n" + "\n".join(erros) + "\n\n"
@@ -338,7 +354,7 @@ class BatchPage(QWidget):
             KEY_NOTIFY, True, type=bool
         ):
             return
-        linhas = [resumo] + linhas_alerta + erros
+        linhas = [resumo] + linhas_alerta + faltas + erros
         if len(linhas) > 9:
             linhas = linhas[:9] + ["... — veja a lista completa no app"]
         window = self.window()

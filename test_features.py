@@ -387,7 +387,20 @@ def main() -> None:
             len(batch_results) == 2,
             str([r["status"] for r in batch_results]),
         )
-        saida = pac1 / "PACIENTE UM.pdf"
+        # faltam AIH, FATURAMENTO e DANFE -> a anotacao vai no nome
+        # do dossie E da pasta (renomeada)
+        pac1_ok = next(root.glob("PACIENTE UM*"))
+        saida = next(
+            p for p in pac1_ok.glob("*.pdf")
+            if not p.name.endswith(".tmp.pdf")
+            and p.stem.startswith("PACIENTE UM")
+        )
+        check(
+            "Lote: saida anota docs faltantes no nome",
+            "falta" in saida.stem and "(falta" in pac1_ok.name
+            and "AIH" in saida.stem,
+            saida.name,
+        )
         check("Lote: saida salva na pasta do paciente", saida.exists())
         if saida.exists():
             texts = page_texts(saida)
@@ -404,14 +417,15 @@ def main() -> None:
         )
         # crash simulation: saida truncada + resto .tmp.pdf -> reprocessa
         saida.write_bytes(b"%PDF-1.4 truncado")  # corrompe a saida
-        (pac1 / "PACIENTE UM.tmp.pdf").write_bytes(b"lixo de crash")
+        tmp_crash = saida.with_suffix(".tmp.pdf")
+        tmp_crash.write_bytes(b"lixo de crash")
         rerun = auto_sort.organize_batch(root)
         ok_rerun = rerun[0]
         check(
             "Lote: saida corrompida e reprocessada",
             ok_rerun["status"] == "ok"
             and auto_sort._is_valid_output(saida)
-            and not (pac1 / "PACIENTE UM.tmp.pdf").exists(),
+            and not tmp_crash.exists(),
             f"{ok_rerun['status']}",
         )
         # auditoria: guia com nome de outro paciente deve ser suspeita
@@ -497,14 +511,15 @@ def main() -> None:
 
         # cache de OCR: arquivo substituido (mesmo nome) nao reusa
         # resultado velho — a assinatura inclui mtime/tamanho
-        with pymupdf.open(pac4 / "bom.pdf") as d_sig:
+        pac4_ok = next(root.glob("ANA SOUZA*"))  # pasta foi renomeada
+        with pymupdf.open(pac4_ok / "bom.pdf") as d_sig:
             sig1 = auto_sort._file_sig(d_sig, "x")
         time.sleep(0.02)
         doc = pymupdf.open()
         doc.new_page()
-        doc.save(pac4 / "bom.pdf")  # sobrescreve: outro conteudo
+        doc.save(pac4_ok / "bom.pdf")  # sobrescreve: outro conteudo
         doc.close()
-        with pymupdf.open(pac4 / "bom.pdf") as d_sig:
+        with pymupdf.open(pac4_ok / "bom.pdf") as d_sig:
             sig2 = auto_sort._file_sig(d_sig, "x")
         check(
             "Cache: assinatura muda quando arquivo e substituido",
@@ -543,11 +558,18 @@ def main() -> None:
             and any(p.name == "solto.pdf" for p in folders_now[0][1]),
             str([f.name for f, _ in folders_now]),
         )
-        # a saida <pasta>.pdf nao conta como insumo da pasta
-        pac1_pdfs = dict(folders_now)[pac1]
+        # a saida <pasta>.pdf (mesmo com anotacao falta) nao conta
+        # como insumo da pasta
+        pac1_key = next(
+            f for f, _ in folders_now if f.name.startswith("PACIENTE UM")
+        )
+        pac1_pdfs = dict(folders_now)[pac1_key]
         check(
             "Lote: saida nao conta como arquivo de entrada",
-            all(p.name != "PACIENTE UM.pdf" for p in pac1_pdfs),
+            all(
+                "falta" not in p.stem and p.stem != "PACIENTE UM"
+                for p in pac1_pdfs
+            ),
             str([p.name for p in pac1_pdfs]),
         )
 
