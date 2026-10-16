@@ -546,6 +546,174 @@ def main() -> None:
             and "anulada" in entry6.get("detail", ""),
             str(entry6),
         )
+        # perfil do processo: conteudo ("retirada de materiais") vence
+        # nome neutro; nome da raiz serve de pista; sem evidencia, cai
+        # no padrao ortopedia
+        from app.core.dossier_profiles import PROFILES
+        d_ret = pymupdf.open()
+        pg = d_ret.new_page()
+        pg.insert_text(
+            (72, 72), "Ortopedia - Retirada de Materiais de Sintese"
+        )
+        d_ret.save(root / "detect.pdf")
+        d_ret.close()
+        with pymupdf.open(root / "detect.pdf") as dchk:
+            kind_c = auto_sort.detect_process_kind(root, [dchk])
+        check(
+            "Perfil: retirada detectada pelo conteudo",
+            kind_c.key == "retirada"
+            and "DANFE" not in [l for _, l in kind_c.required],
+            str(kind_c),
+        )
+        d_neut = pymupdf.open()
+        d_neut.new_page()
+        d_neut.close()
+        ret_dir = root.parent / "RETIRADAS" / "PACIENTE RET"
+        ret_dir.mkdir(parents=True)
+        with pymupdf.open() as dchk:
+            dchk.new_page()
+            kind_n = auto_sort.detect_process_kind(ret_dir, [dchk])
+        check(
+            "Perfil: raiz RETIRADAS vira retirada pelo nome",
+            kind_n.key == "retirada",
+            str(kind_n),
+        )
+        with pymupdf.open() as dchk:
+            dchk.new_page()
+            kind_o = auto_sort.detect_process_kind(
+                root / "PACIENTE QQ", [dchk]
+            )
+        check(
+            "Perfil: sem pista cai em ortopedia",
+            kind_o.key == "ortopedia"
+            and PROFILES["ortopedia"] is kind_o,
+            str(kind_o),
+        )
+
+        # revisao: detectada pela "consulta de revisao" no conteudo
+        # ou pelo nome da raiz do lote ("REVISOES")
+        d_rev = pymupdf.open()
+        pg = d_rev.new_page()
+        pg.insert_text((72, 72), "Guia atendimento consulta de revisao")
+        d_rev.save(root / "detect_rev.pdf")
+        d_rev.close()
+        with pymupdf.open(root / "detect_rev.pdf") as dchk:
+            kind_r = auto_sort.detect_process_kind(root, [dchk])
+        check(
+            "Perfil: revisao detectada pelo conteudo",
+            kind_r.key == "revisao"
+            and "DANFE" not in [l for _, l in kind_r.required],
+            str(kind_r),
+        )
+        rev_dir = root.parent / "REVISOES" / "PACIENTE REV"
+        rev_dir.mkdir(parents=True)
+        with pymupdf.open() as dchk:
+            dchk.new_page()
+            kind_rn = auto_sort.detect_process_kind(rev_dir, [dchk])
+        check(
+            "Perfil: raiz REVISOES vira revisao pelo nome",
+            kind_rn.key == "revisao",
+            str(kind_rn),
+        )
+
+        # retirada: raio-x COM implante (fios/placa) vem antes do
+        # pos-retirada; no perfil ortopedia a ordem segue a data
+        from app.core.dossier_profiles import RETIRADA
+
+        def _xray_doc(with_implant: bool):
+            d = pymupdf.open()
+            pg = d.new_page(width=600, height=800)
+            pg.draw_rect(pg.rect, fill=(0.05, 0.05, 0.05))
+            for i in range(6):
+                pg.draw_circle(
+                    (150 + i * 60, 300 + (i % 2) * 80), 45,
+                    fill=(0.55, 0.55, 0.55),
+                )
+            if with_implant:
+                pg.draw_line((180, 350), (420, 640),
+                             color=(1, 1, 1), width=7)
+                pg.draw_line((420, 350), (180, 640),
+                             color=(1, 1, 1), width=7)
+            return d
+
+        rx_sem, rx_com = _xray_doc(False), _xray_doc(True)
+        ord_ret = auto_sort.suggest_order([rx_sem, rx_com], RETIRADA)
+        check(
+            "Retirada: raio-x com OPME vem antes",
+            ord_ret[:2] == [(1, 0), (0, 0)],
+            str(ord_ret),
+        )
+        ord_ort = auto_sort.suggest_order([rx_sem, rx_com])
+        check(
+            "Ortopedia: raio-x mantem ordem estavel",
+            ord_ort[:2] == [(0, 0), (1, 0)],
+            str(ord_ort),
+        )
+        rx_sem.close()
+        rx_com.close()
+
+        # retirada: termo de anestesia so e obrigatorio quando o
+        # procedimento e "retirada de placa e/ou parafusos"; fio/pino
+        # dispensa
+        pac_placa = ret_dir.parent / "PACIENTE PLACA"
+        pac_placa.mkdir(exist_ok=True)
+        d = pymupdf.open()
+        pg = d.new_page()
+        pg.insert_text(
+            (72, 72), "Retirada de placa e/ou parafusos solicitada"
+        )
+        d.save(pac_placa / "doc.pdf")
+        d.close()
+        res_placa = auto_sort.process_folder(pac_placa, [pac_placa / "doc.pdf"])
+        check(
+            "Retirada placa: termo anestesia cobrado",
+            "TERMO ANESTESIA" in res_placa["missing"],
+            str(res_placa["missing"]),
+        )
+        pac_fio = ret_dir.parent / "PACIENTE FIO"
+        pac_fio.mkdir(exist_ok=True)
+        d = pymupdf.open()
+        pg = d.new_page()
+        pg.insert_text(
+            (72, 72), "Retirada de fio ou pino intra-osseo"
+        )
+        d.save(pac_fio / "doc.pdf")
+        d.close()
+        res_fio = auto_sort.process_folder(pac_fio, [pac_fio / "doc.pdf"])
+        check(
+            "Retirada fio: termo anestesia nao cobrado",
+            "TERMO ANESTESIA" not in res_fio["missing"],
+            str(res_fio["missing"]),
+        )
+
+        # retirada: documentos com procedimentos divergentes (um diz
+        # fio, outro placa) geram alerta no resultado do lote
+        pac_div = ret_dir.parent / "PACIENTE DIV"
+        pac_div.mkdir(exist_ok=True)
+        for nome, txt in (
+            ("a.pdf", "Retirada de fio ou pino intra-osseo"),
+            ("b.pdf", "Retirada de placa e/ou parafusos"),
+        ):
+            d = pymupdf.open()
+            pg = d.new_page()
+            pg.insert_text((72, 72), txt)
+            d.save(pac_div / nome)
+            d.close()
+        res_div = auto_sort.process_folder(
+            pac_div, [pac_div / "a.pdf", pac_div / "b.pdf"]
+        )
+        div = res_div["proc_divergence"] or {}
+        check(
+            "Retirada: procedimento divergente alertado",
+            set(div) == {"fio/pino", "placa/parafusos"},
+            str(div),
+        )
+        check(
+            "Retirada: dossie consistente nao alerta",
+            res_fio["proc_divergence"] is None,
+            str(res_fio["proc_divergence"]),
+        )
+
         # PDF solto na raiz (ao lado das subpastas) nao e ignorado
         doc = pymupdf.open()
         doc.new_page()

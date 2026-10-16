@@ -222,8 +222,13 @@ class BatchPage(QWidget):
             self.progress.setValue(entry["index"])
             suspects = entry.get("suspects") or []
             excluded = entry.get("excluded") or []
+            # tipo de processo detectado (retirada etc.) — ortopedia,
+            # o caso comum, nao ganha etiqueta
+            tag = ""
+            if entry.get("kind") and entry["kind"] != "ortopedia":
+                tag = f" [{entry.get('kind_label', '').upper()}]"
             parts = [
-                f"{entry['folder']} — {entry['pages']} paginas → "
+                f"{entry['folder']}{tag} — {entry['pages']} paginas → "
                 f"{entry['output']}"
             ]
             if excluded:
@@ -237,12 +242,19 @@ class BatchPage(QWidget):
             missing = entry.get("missing") or []
             if missing:
                 parts.append("FALTA: " + ", ".join(missing))
+            divergence = entry.get("proc_divergence")
+            if divergence:
+                refs = "; ".join(
+                    f"{tipo}: {', '.join(pags[:4])}"
+                    for tipo, pags in divergence.items()
+                )
+                parts.append(f"PROCEDIMENTO DIVERGENTE — {refs}")
             if skipped:
                 parts.append(
                     f"ATENCAO: {len(skipped)} arquivo(s) ilegivel(is): "
                     + ", ".join(skipped)
                 )
-            if suspects or skipped or missing:
+            if suspects or skipped or missing or divergence:
                 item.setIcon(self._icon("alerta"))
             if suspects:
                 pags = ", ".join(str(s["pos"]) for s in suspects)
@@ -331,8 +343,21 @@ class BatchPage(QWidget):
             f"• {r['folder']} — falta {', '.join(r['missing'])}"
             for r in results if r.get("missing")
         ]
-        if linhas_alerta or erros or faltas:
+        divergentes = []
+        for r in results:
+            div = r.get("proc_divergence")
+            if div:
+                tipos = " x ".join(div.keys())
+                divergentes.append(
+                    f"• {r['folder']} — procedimento divergente: {tipos}"
+                )
+        if linhas_alerta or erros or faltas or divergentes:
             corpo = resumo + "\n\n"
+            if divergentes:
+                corpo += (
+                    "Documentos com procedimentos divergentes:\n"
+                    + "\n".join(divergentes) + "\n\n"
+                )
             if linhas_alerta:
                 corpo += (
                     "Paginas que podem pertencer a outro paciente:\n"
@@ -354,7 +379,9 @@ class BatchPage(QWidget):
             KEY_NOTIFY, True, type=bool
         ):
             return
-        linhas = [resumo] + linhas_alerta + faltas + erros
+        linhas = (
+            [resumo] + divergentes + linhas_alerta + faltas + erros
+        )
         if len(linhas) > 9:
             linhas = linhas[:9] + ["... — veja a lista completa no app"]
         window = self.window()

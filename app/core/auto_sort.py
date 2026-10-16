@@ -1,18 +1,28 @@
-"""Ordenacao automatica de paginas digitalizadas por perfil de dossie.
+﻿"""Ordenacao automatica de paginas digitalizadas por perfil de dossie.
 
 Cada pagina e identificada pelo texto nativo (paginas digitais) ou por
 OCR (paginas escaneadas), usando fragmentos de palavras-chave por tipo
-de documento. O perfil ORTOPEDIA segue a sequencia padrao da conta
-hospitalar/OPME do SUS.
+de documento. O perfil do processo (ortopedia, retirada...) — ordem
+das classes e documentos obrigatorios — mora em dossier_profiles; os
+detectores visuais de anulacao, em annul_detect.
 """
 import os
 import re
-import unicodedata
 from difflib import SequenceMatcher
 from pathlib import Path
 
 import numpy as np
 import pymupdf
+
+from app.core import annul_detect
+from app.core import xray_detect
+from app.core.dossier_profiles import (
+    CLASS_PATTERNS,
+    DEFAULT_PROFILE,
+    DossierProfile,
+    detect,
+)
+from app.core.dossier_profiles import norm as _normalize
 
 _ocr_engine = None
 
@@ -44,16 +54,6 @@ def _ocr():
     return _ocr_engine
 
 
-def _normalize(text: str) -> str:
-    """Maiusculo, sem acento e sem espacos/pontuacao — robusto ao OCR
-    (que frequentemente junta as palavras, ex.: 'TERMODECONSENTIMENTO')."""
-    text = unicodedata.normalize("NFD", text)
-    return "".join(
-        c for c in text.upper()
-        if unicodedata.category(c) != "Mn" and c.isalnum()
-    )
-
-
 # Padroes de documento de identidade/CPF escaneado. Fragmentos curtos
 # toleram erros comuns do OCR (ex.: "CARTEIRADEDENTIDADE" com D).
 _DOC_ID = [
@@ -62,405 +62,9 @@ _DOC_ID = [
 ]
 _CPF_RE = re.compile(r"\d{3}\.\d{3}\.\d{3}-\d{2}")
 
-# Ordem final do dossie. doc_paciente/doc_responsavel e raiox sao
-# resolvidos por heuristicas proprias (nome do paciente / pixels escuros),
-# nao por palavras-chave.
-ORTOPEDIA = [
-    ("guia",                 ["GUIADEAUTORIZACAODEINTERN", "CREDENCIAMENTODECIRURGIAS", "SENHADEAUTORIZACAO"]),
-    ("laudo",                ["LAUDOPARASOLICITACAO", "SOLICITACAODEAUTORIZACAO", "JUSTIFICATIVADAINTERNACAO"]),
-    ("doc_paciente",         []),
-    ("doc_responsavel",      []),
-    ("relatorio_social",     ["RELATORIOSOCIAL", "ASSISTENTESOCIAL", "CRESS"]),
-    ("ficha",                ["ATENDENTE", "DATADAEMISSAO"]),
-    ("faturamento",          ["FATURAMENTOINDIVIDUAL", "TERMADEADESAO", "TERMOCOMPROMISSO"]),
-    ("termo_cirurgia",       ["TERMODECONSENTIMENTO", "CIRURGIADE"]),
-    ("termo_anestesia",      ["AVALIACAOPREANESTESICA", "PREANESTESICA", "PROCEDIMENTOSANESTESICOS"]),
-    ("descricao_anestesica", ["DESCRICAOANESTESICA"]),
-    ("descricao_cirurgica",  ["DESCRICAOCIRURGICA", "ATOCIRURGICO"]),
-    ("raiox",                []),
-    ("nfe",                  ["DANFE", "NOTAFISCALELETRONICA", "CHAVEDEACESSO"]),
-    ("relatorio_alta",       ["RELATORIODEALTA", "RECEBEUALTA", "ALTAHOSPITALAR"]),
-    ("espelho_aih",          ["ESPELHODAAIH"]),
-]
-
 
 # Palavras que marcam documento anulado/cancelado/rasurado.
 _CANCEL_WORDS = ("ANULADO", "CANCELADO", "RASURADO", "SEMVALIDADE")
-
-
-def _has_big_x(arr: np.ndarray) -> bool:
-    """Detecta o 'X' de anulacao sobre a pagina.
-
-    Dois caminhos, porque a marcacao pode ser feita com caneta escura
-    sobre papel claro ou com caneta colorida sobre filme/raio-x:
-
-    1. mascara de tinta colorida (saturacao alta) — tracos diagonais
-       SOLIDOS (re-detectados ou de grande cobertura) nas duas
-       direcoes cruzando na regiao central
-    2. bordas em cinza — diagonais de 0,3w x 0,3h nas duas direcoes
-       cujo cruzamento cai no interior de ambos os segmentos e na
-       regiao central; o teste de interioridade rejeita bordas de
-       documento digitalizado torto (se tocam so nos cantos)
-    """
-    import cv2
-
-    h, w = arr.shape[:2]
-    m = min(h, w)
-
-    def collect(
-        mask: np.ndarray, min_len: float, th: int, gap: int
-    ) -> tuple[list, list]:
-        lines = cv2.HoughLinesP(
-            mask, 1, np.pi / 180, threshold=th,
-            minLineLength=int(min_len * m), maxLineGap=gap,
-        )
-        pos, neg = [], []
-        if lines is not None:
-            for x1, y1, x2, y2 in lines[:, 0]:
-                dx, dy = x2 - x1, y2 - y1
-                if dx == 0:
-                    continue
-                slope = dy / dx
-                if 0.4 <= abs(slope) <= 2.5:
-                    (pos if slope > 0 else neg).append((x1, y1, x2, y2))
-        return pos, neg
-
-    def crosses_center(a, b) -> bool:
-        """Cruzamento dentro da regiao central E na porcao interior de
-        ambos os tracos — num X de anulacao cada risco continua alem do
-        ponto de encontro; as bordas de um documento girado se tocam
-        apenas nas pontas (cantos do cartao)."""
-        ax, ay, bx, by = a
-        cx, cy, dx_, dy_ = b
-        den = (bx - ax) * (dy_ - cy) - (by - ay) * (dx_ - cx)
-        if den == 0:
-            return False
-        t = ((cx - ax) * (dy_ - cy) - (cy - ay) * (dx_ - cx)) / den
-        ix, iy = ax + t * (bx - ax), ay + t * (by - ay)
-        blen2 = (dx_ - cx) ** 2 + (dy_ - cy) ** 2
-        tb = ((ix - cx) * (dx_ - cx) + (iy - cy) * (dy_ - cy)) / blen2
-        straddle = 0.12 <= t <= 0.88 and 0.12 <= tb <= 0.88
-        return straddle and (0.15 * w <= ix <= 0.85 * w) and (
-            0.15 * h <= iy <= 0.85 * h
-        )
-
-    def stroke_darkness(s, band: int = 4) -> float:
-        """Fracao de pixels escuros (<120) na banda ao longo do traco.
-        Risco de caneta e uma faixa escura continua (~0,4+); borda de
-        cartao/documento girado e um degrau fino entre areas claras
-        (~0,15-0,2) — e o que separa um X de anulacao de bordas de
-        RG/CNH digitalizados de lado."""
-        g = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
-        gh, gw = g.shape
-        x1, y1, x2, y2 = [int(round(v)) for v in s]
-        n = int(max(abs(x2 - x1), abs(y2 - y1))) + 1
-        xs = np.linspace(x1, x2, n).astype(int)
-        ys = np.linspace(y1, y2, n).astype(int)
-        ln = np.hypot(x2 - x1, y2 - y1) or 1
-        px_, py_ = -(y2 - y1) / ln, (x2 - x1) / ln
-        dark, total = 0, 0
-        for off in range(-band, band + 1):
-            xx = np.clip(xs + int(round(px_ * off)), 0, gw - 1)
-            yy = np.clip(ys + int(round(py_ * off)), 0, gh - 1)
-            dark += int((g[yy, xx] < 120).sum())
-            total += n
-        return dark / total
-
-    def solid_strokes(grp) -> list:
-        """Agrupa segmentos colineares (rho proximo) no mesmo traco e
-        devolve um representante dos tracos SOLIDOS — re-detectados 3+
-        vezes ou cobrindo 0,6x o lado menor.
-
-        Um risco de caneta grosso e visto varias vezes pelo Hough;
-        bordas de implante/arte do raio-x aparecem 1-2 vezes — e isso
-        que separa o X de anulacao de estrutura da propria imagem.
-        """
-        # mesmo traco = mesma inclinacao (bucket 0,125) E mesmo rho;
-        # sem isso, segmentos de angulos distintos com rho parecido
-        # (artefatos do raio-x) formariam um "traco" falso
-        buckets: dict[float, list] = {}
-        for x1, y1, x2, y2 in grp:
-            slope = (y2 - y1) / (x2 - x1)
-            buckets.setdefault(round(slope * 8) / 8, []).append(
-                (x1, y1, x2, y2)
-            )
-        solids = []
-        for segs_in in buckets.values():
-            items = sorted(
-                (
-                    (x1 * (y2 - y1) - y1 * (x2 - x1))
-                    / np.hypot(x2 - x1, y2 - y1),
-                    (x1, y1, x2, y2),
-                )
-                for x1, y1, x2, y2 in segs_in
-            )
-            clusters: list[list] = []
-            for rho, seg in items:
-                if clusters and rho - clusters[-1][1] <= 0.05 * m:
-                    clusters[-1][0].append(seg)
-                    clusters[-1][1] = rho
-                else:
-                    clusters.append([[seg], rho])
-            for segs, _ in clusters:
-                x1, y1, x2, y2 = segs[0]
-                L = np.hypot(x2 - x1, y2 - y1)
-                ux, uy = (x2 - x1) / L, (y2 - y1) / L
-                ts = [
-                    x * ux + y * uy
-                    for s in segs
-                    for x, y in ((s[0], s[1]), (s[2], s[3]))
-                ]
-                if len(segs) < 3 and (max(ts) - min(ts)) < 0.6 * m:
-                    continue
-                # reconstrói a extensao total do traco na linha de
-                # suporte (rho medio) — necessario para o teste de
-                # atravessamento do X
-                rho = np.mean(
-                    [
-                        (s[0] * (s[3] - s[1]) - s[1] * (s[2] - s[0]))
-                        / np.hypot(s[2] - s[0], s[3] - s[1])
-                        for s in segs
-                    ]
-                )
-                px, py = rho * uy, -rho * ux
-                solids.append(
-                    (
-                        px + min(ts) * ux,
-                        py + min(ts) * uy,
-                        px + max(ts) * ux,
-                        py + max(ts) * uy,
-                    )
-                )
-        return solids
-
-    # 1) tinta colorida (caneta azul/vermelha sobre papel ou filme).
-    # Teto de cobertura: risco de caneta e esparso (~3%); documento
-    # colorido inteiro (CNH, carimbo grande) gera "tracos" nas bordas.
-    # Saturacao >60 (nao 30): o tom azulado de filme de raio-x fica
-    # em S~35 — logo acima do limiar baixo, as bordas diagonais do
-    # filme girado viravam um "X" falso. Caneta de verdade tem S~60+.
-    hsv = cv2.cvtColor(arr, cv2.COLOR_RGB2HSV)
-    ink = ((hsv[:, :, 1] > 60) & (hsv[:, :, 2] > 40)).astype(
-        np.uint8
-    ) * 255
-    # Teto 1,2%: pagina de X a caneta tem ~0,5-0,7% de tinta;
-    # documento colorido inteiro (CNH com guilloche ~2%) produz
-    # tracos diagonais falsos ate com os filtros geometricos.
-    if (ink > 0).mean() <= 0.012:
-        ink = cv2.morphologyEx(
-            ink, cv2.MORPH_CLOSE,
-            cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7)),
-        )
-        pos, neg = collect(ink, 0.15, 15, 60)
-        ps, ns = solid_strokes(pos), solid_strokes(neg)
-        if ps and ns and any(
-            crosses_center(p, n) for p in ps for n in ns
-        ):
-            return True
-
-    # 2) traco escuro sobre papel claro (caneta preta, carimbo).
-    # O Hough quebra uma diagonal longa em segmentos ~0,3-0,5x a
-    # pagina — solid_strokes reagrupa os pedacos colineares e
-    # reconstrói a extensao total do traco; aqui exigimos traco
-    # reconstruido >= 0,85x o lado menor (um X a caneta atravessa a
-    # pagina inteira — guilloche de certidao e bordas de cartao ficam
-    # bem abaixo) e o teste de interioridade barra encontros de canto.
-    gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
-    edges = cv2.Canny(gray, 50, 150)
-    pos, neg = collect(edges, 0.3, 60, 20)
-    # muitos segmentos diagonais = textura (guilloche de certidao,
-    # diagramacao), nao um X — um risco de anulacao sao poucos tracos
-    if len(pos) + len(neg) > 35:
-        return False
-    ps = [
-        s for s in solid_strokes(pos)
-        if np.hypot(s[2] - s[0], s[3] - s[1]) >= 0.85 * m
-    ]
-    ns = [
-        s for s in solid_strokes(neg)
-        if np.hypot(s[2] - s[0], s[3] - s[1]) >= 0.85 * m
-    ]
-    return bool(ps) and bool(ns) and any(
-        crosses_center(p, n)
-        and stroke_darkness(p) >= 0.25
-        and stroke_darkness(n) >= 0.25
-        for p in ps
-        for n in ns
-    )
-
-
-def _has_color_mark(arr: np.ndarray) -> bool:
-    """Detecta marcacao de anulacao com caneta colorida que NAO e X:
-    ovais, circulos e elipses desenhados sobre campos ou a pagina.
-
-    Tres propriedades de uma marcacao a caneta separam isso de ruido:
-    tinta saturada (a mesma mascara do caminho 1 de _has_big_x),
-    formato FECHADO grande (perimetro e area minimos) e anel FINO
-    (interior quase vazio). Isso deixa de fora carimbos (interior
-    denso de texto), sublinhados (razao de aspecto de linha) e
-    documentos coloridos inteiros (teto de cobertura de 15%).
-    """
-    import cv2
-
-    h, w = arr.shape[:2]
-    m = min(h, w)
-    hsv = cv2.cvtColor(arr, cv2.COLOR_RGB2HSV)
-    ink = ((hsv[:, :, 1] > 30) & (hsv[:, :, 2] > 40)).astype(
-        np.uint8
-    ) * 255
-    if (ink > 0).mean() > 0.15:
-        return False  # documento colorido inteiro (CNH etc.)
-
-    ink = cv2.morphologyEx(
-        ink,
-        cv2.MORPH_CLOSE,
-        cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9)),
-    )
-    contours, _ = cv2.findContours(
-        ink, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-    )
-    for c in contours:
-        x, y, cw, ch = cv2.boundingRect(c)
-        extent = (cw * ch) / (w * h)
-        if extent < 0.02:
-            continue  # marca pequena (check, rubrica)
-        if extent > 0.20:
-            continue  # estrutura do documento (tabela, moldura)
-        if min(cw, ch) / max(cw, ch) < 0.15:
-            continue  # linha/sublinhado — aberto, nao fechado
-        if cv2.arcLength(c, True) < 1.6 * m:
-            # lacada de assinatura forma anel pequeno (1,2-1,35m); a
-            # marcacao de anulacao circula conteudo (2,4m+)
-            continue
-        inner = (ink[y : y + ch, x : x + cw] > 0).mean()
-        if inner > 0.18:
-            continue  # interior cheio: carimbo/realce, nao anel
-        # Solidez (area do contorno / hull convexo): um oval fechado
-        # cobre quase todo o hull (~0,5+); assinatura e rabisco sao
-        # esparsos dentro do proprio contorno (~0,2).
-        hull = cv2.convexHull(c)
-        if cv2.contourArea(c) / max(cv2.contourArea(hull), 1) < 0.40:
-            continue
-        return True
-    return False
-
-
-def _has_box_mark(arr: np.ndarray) -> bool:
-    """Detecta marcacao de anulacao em forma de CAIXA/RETANGULO a
-    caneta — contorno quebrado demais para _has_color_mark, que exige
-    anel fechado. Aqui o sinal e geometrico: um par de segmentos quase
-    horizontais sobrepostos em X e separados em Y (topo e base da
-    caixa), com um segmento quase vertical ligando-os numa ponta.
-
-    Discriminadores contra tabelas/molduras do proprio documento:
-    - largura da caixa <= 0,6 da pagina (moldura de tabela ~0,84)
-    - altura <= 0,2 e densidade de tinta no interior baixa (caixa a
-      caneta envolve texto/impressao, nao mais linhas de grade)
-    Saturacao >60: reduz o cast azulado de scan que pinta linhas de
-    tabela impressas de "tinta colorida".
-    """
-    import cv2
-
-    h, w = arr.shape[:2]
-    hsv = cv2.cvtColor(arr, cv2.COLOR_RGB2HSV)
-    ink = ((hsv[:, :, 1] > 60) & (hsv[:, :, 2] > 40)).astype(
-        np.uint8
-    )
-    dark = (cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY) < 120).astype(
-        np.uint8
-    )
-    if ink.mean() > 0.006:
-        # formulario com grade impressa colorida, cartao (RG/CNH/SUS)
-        # ou documento colorido — marcacao a caneta e ~0,2% da pagina
-        return False
-
-    lines = cv2.HoughLinesP(
-        ink,
-        1,
-        np.pi / 180,
-        threshold=20,
-        minLineLength=30,
-        maxLineGap=15,
-    )
-    if lines is None:
-        return False
-
-    hs, vs = [], []
-    for x1, y1, x2, y2 in lines[:, 0]:
-        dx, dy = x2 - x1, y2 - y1
-        length = np.hypot(dx, dy)
-        if length < 40:
-            continue
-        slope = abs(dy / dx) if dx else 99
-        if slope < 0.15:
-            hs.append((min(x1, x2), (y1 + y2) / 2, max(x1, x2)))
-        elif slope > 6:
-            vs.append((min(y1, y2), (x1 + x2) / 2, max(y1, y2)))
-
-    if len(hs) + len(vs) > 25:
-        # a grade da propria tabela e impressa em cor saturada — as
-        # "caixas" sao celulas do formulario, nao marcacao. Uma caixa
-        # a caneta gera poucas linhas isoladas (~10-16 no total).
-        return False
-
-    boxes: list[tuple[int, int, int, int]] = []
-    for a in range(len(hs)):
-        for b in range(a + 1, len(hs)):
-            x0a, ya, x1a = hs[a]
-            x0b, yb, x1b = hs[b]
-            gap_y = abs(ya - yb)
-            if not 20 <= gap_y <= 0.2 * h:
-                continue
-            bx0, bx1 = min(x0a, x0b), max(x1a, x1b)
-            if bx1 - bx0 > 0.6 * w:
-                continue  # moldura de tabela/pagina inteira
-            if min(x1a, x1b) - max(x0a, x0b) < 50:
-                continue  # horizontais nao se sobrepoem
-            for y0v, xv, y1v in vs:
-                if y1v - y0v < 0.5 * gap_y:
-                    continue
-                near_edge = min(
-                    abs(xv - x0a), abs(xv - x1a),
-                    abs(xv - x0b), abs(xv - x1b),
-                ) < 25
-                spans = (y0v - 15 <= min(ya, yb)
-                         and y1v + 15 >= max(ya, yb))
-                if not (near_edge and spans):
-                    continue
-                # densidade no interior ENCOLHIDO — sem isso os
-                # proprios tracos da caixa contaminam a medida (numa
-                # caixa pequena as 4 bordas sao ~12% da area)
-                y0, y1 = int(min(ya, yb)), int(max(ya, yb))
-                mx = max(8, int(0.08 * (bx1 - bx0)))
-                my = max(8, int(0.15 * gap_y))
-                roi = ink[y0 + my : y1 - my, int(bx0) + mx : int(bx1) - mx]
-                if roi.size == 0:
-                    continue  # caixa pequena demais p/ interior encolhido
-                inner = roi.mean()
-                if inner >= 0.04:
-                    continue  # interior com tinta: carimbo preenchido
-                # a caixa precisa cercar CONTEUDO (texto do campo) —
-                # sublinhado/tira de assinatura forma caixa vazia
-                dk = dark[y0 + my : y1 - my,
-                          int(bx0) + mx : int(bx1) - mx].mean()
-                if dk < 0.02:
-                    continue
-                box = (int(bx0), y0, int(bx1), y1)
-                # a mesma caixa fisica e detectada varias vezes
-                # (Hough emite linhas duplicadas) — conta uma so
-                dup = any(
-                    abs(box[0] - q[0]) < 20 and abs(box[1] - q[1]) < 20
-                    and abs(box[2] - q[2]) < 20 and abs(box[3] - q[3]) < 20
-                    for q in boxes
-                )
-                if not dup:
-                    boxes.append(box)
-                    if len(boxes) > 8:
-                        # tabela/grade gera dezenas de caixas
-                        # distintas; marcacao a caneta e 1-3
-                        return False
-                break  # proxima linha vertical so conta uma vez
-    return len(boxes) > 0
 
 
 def _ocr_page(page: pymupdf.Page) -> tuple[str, float, bool]:
@@ -482,9 +86,7 @@ def _ocr_page(page: pymupdf.Page) -> tuple[str, float, bool]:
 
     arr = render(0)
     dark = float((arr.mean(axis=2) < 100).mean())
-    cancelled = (
-        _has_big_x(arr) or _has_color_mark(arr) or _has_box_mark(arr)
-    )
+    cancelled = annul_detect.is_annulled(arr)
     if dark >= 0.5:
         return "", dark, cancelled
 
@@ -551,6 +153,22 @@ def _exam_date(text_norm: str) -> int:
     return best
 
 
+def _has_implant(page: pymupdf.Page) -> bool:
+    """Renderiza a pagina de raio-x e detecta implante metalico.
+    Falha na renderizacao nao derruba a ordenacao — trata como
+    sem implante (vai para depois no perfil de retirada)."""
+    try:
+        pix = page.get_pixmap(
+            matrix=pymupdf.Matrix(1.5, 1.5), alpha=False
+        )
+        arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(
+            pix.height, pix.width, pix.n
+        )
+        return xray_detect.has_implant(arr)
+    except Exception:  # noqa: BLE001 - pagina ruim nao impede o lote
+        return False
+
+
 def _scan(
     docs: list[pymupdf.Document],
 ) -> tuple[
@@ -570,7 +188,10 @@ def _scan(
     todo: list[tuple[tuple[int, int], tuple, pymupdf.Page, str]] = []
 
     for d, doc in enumerate(docs):
-        sig = _file_sig(doc, f"__memdoc_{d}")
+        # documento sem arquivo (memoria) usa o id do objeto —
+        # pelo indice dois Document distintos de chamadas
+        # diferentes colidiriam no cache de OCR
+        sig = _file_sig(doc, f"__memdoc_{id(doc)}")
         for i in range(doc.page_count):
             key = (d, i)
             try:
@@ -596,11 +217,7 @@ def _scan(
                         pix.samples, dtype=np.uint8
                     ).reshape(pix.height, pix.width, pix.n)
                     darks[key] = float((arr.mean(axis=2) < 100).mean())
-                    annulled[key] = (
-                        _has_big_x(arr)
-                        or _has_color_mark(arr)
-                        or _has_box_mark(arr)
-                    )
+                    annulled[key] = annul_detect.is_annulled(arr)
                 except Exception:  # noqa: BLE001
                     darks[key] = 0.0
                     annulled[key] = False
@@ -649,7 +266,7 @@ def _classify(
             continue
         # melhor score de palavras-chave
         best_class, best_score = "", 0
-        for class_name, patterns in ORTOPEDIA:
+        for class_name, patterns in CLASS_PATTERNS.items():
             score = sum(1 for p in patterns if p in text_norm)
             if score > best_score:
                 best_class, best_score = class_name, score
@@ -681,25 +298,46 @@ def classify_documents(
     return _classify(raw_texts, norms, darks, annulled, name)
 
 
-def suggest_order(docs: list[pymupdf.Document]) -> list[tuple[int, int]]:
-    """Retorna todas as (doc, pagina) na sequencia do perfil ORTOPEDIA.
+def suggest_order(
+    docs: list[pymupdf.Document],
+    profile: DossierProfile | None = None,
+) -> list[tuple[int, int]]:
+    """Retorna todas as (doc, pagina) na sequencia do perfil.
 
     Paginas anuladas (X/rasura) sao EXCLUIDAS — nao entram no dossie.
     Paginas nao identificadas vao para o fim, na ordem original.
     Raios-X sao ordenados pela data do exame (pre antes de pos).
     """
+    profile = profile or DEFAULT_PROFILE
     raw_texts, darks, annulled = _scan(docs)
     norms = {k: _normalize(v) for k, v in raw_texts.items()}
     name = _patient_name(list(raw_texts.values()))
     classes = _classify(raw_texts, norms, darks, annulled, name)
 
     order: list[tuple[int, int]] = []
-    for class_name, _ in ORTOPEDIA:
+    for class_name in profile.order:
         group = [k for k in classes if classes[k] == class_name]
         if class_name == "raiox":
-            group.sort(key=lambda k: _exam_date(norms[k]))
+            if profile.xray_opme_first:
+                # retirada: filme COM implante (fio/placa/parafuso)
+                # antes do pos-retirada; a data desempata cada grupo
+                opme = {k: _has_implant(docs[k[0]][k[1]]) for k in group}
+                group.sort(
+                    key=lambda k: (
+                        not opme.get(k, False), _exam_date(norms[k])
+                    )
+                )
+            else:
+                group.sort(key=lambda k: _exam_date(norms[k]))
         order.extend(group)
-    order.extend(k for k in classes if classes[k] == "desconhecido")
+    # desconhecidos e classes fora do perfil (ex.: uma "consulta" que
+    # aparece num lote de ortopedia) vao para o fim — nunca sao
+    # descartadas silenciosamente
+    known = set(profile.order)
+    order.extend(
+        k for k in classes
+        if classes[k] not in known and classes[k] != "anulado"
+    )
     return order
 
 
@@ -878,15 +516,19 @@ def audit_patient(
 
 # ------------------------------------------------------- modo em lote
 
-# Documentos cuja ausencia deve ser sinalizada no nome do dossie/pasta
-# — (classe interna, rotulo exibido) na ordem de exibicao.
-_REQUIRED_DOCS = [
-    ("guia", "GAI"),
-    ("laudo", "AIH"),
-    ("faturamento", "FATURAMENTO"),
-    ("nfe", "DANFE"),
-    ("espelho_aih", "ESPELHO AIH"),
-]
+
+def detect_process_kind(
+    folder: Path, docs: list[pymupdf.Document]
+) -> DossierProfile:
+    """Perfil do processo da pasta: ortopedia, retirada, etc.
+
+    O conteudo OCR das paginas decide primeiro; sem pista no texto,
+    o nome da pasta do paciente e da pasta-mae servem de reserva
+    (raiz do lote "RETIRADAS", por exemplo).
+    """
+    raw_texts, _, _ = _scan(docs)
+    norms = [_normalize(t) for t in raw_texts.values()]
+    return detect(norms, folder.name, folder.parent.name)
 
 
 def _strip_falta(name: str) -> str:
@@ -948,11 +590,12 @@ def _is_valid_output(path: Path) -> bool:
 
 def process_folder(
     folder: Path, pdfs: list[Path], rename_folder: bool = True
-) -> tuple[Path, int, list, list, list, list]:
-    """Junta todos os PDFs da pasta, ordena pelo perfil, audita o nome
-    do paciente e salva o dossie como <pasta>/<nome_da_pasta>.pdf.
+) -> dict:
+    """Junta todos os PDFs da pasta, ordena pelo perfil do processo
+    (ortopedia/retirada), audita o nome do paciente e salva o dossie
+    como <pasta>/<nome_da_pasta>.pdf.
 
-    Documentos obrigatorios ausentes (_REQUIRED_DOCS) viram anotacao
+    Documentos obrigatorios ausentes (profile.required) viram anotacao
     no nome do dossie E da pasta: "NOME (falta AIH, GAI)". Na proxima
     execucao a anotacao e recalculada — documento adicionado some da
     lista, e a pasta volta ao nome limpo quando nada falta.
@@ -964,11 +607,11 @@ def process_folder(
     PDFs que nao abrem sao pulados e reportados — um arquivo corrompido
     nao pode derrubar a pasta inteira.
 
-    Retorna (saida, num_paginas, suspects, excluidas, ilegiveis,
-    faltantes) — suspects com "pos" = a pagina no PDF final; excluidas
-    = paginas anuladas ({file, page}) fora do dossie; ilegiveis =
-    nomes dos arquivos que nao abriram; faltantes = rotulos dos docs
-    obrigatorios ausentes.
+    Retorna {"output", "pages", "suspects", "excluded", "skipped",
+    "missing", "profile"} — suspects com "pos" = a pagina no PDF final;
+    excluded = paginas anuladas ({file, page}) fora do dossie; skipped =
+    nomes dos arquivos que nao abriram; missing = rotulos dos docs
+    obrigatorios ausentes; profile = DossierProfile detectado.
     """
     base = _strip_falta(folder.name)
     docs: list[pymupdf.Document] = []
@@ -992,7 +635,19 @@ def process_folder(
             src_paths.append(path)
         if not docs:
             raise ValueError("nenhum PDF legivel para processar")
-        order = suggest_order(docs)
+        raw_texts, _, _ = _scan(docs)
+        norms_map = {k: _normalize(t) for k, t in raw_texts.items()}
+        norms_list = list(norms_map.values())
+        profile = detect(norms_list, folder.name, folder.parent.name)
+        # procedimentos citados por pagina (retirada: fio x placa) —
+        # dois tipos no mesmo dossie = documentos divergentes
+        proc_pages: dict[str, list[str]] = {}
+        for (d, i), t in norms_map.items():
+            for label, proc_hints in profile.procedures:
+                if any(h in t for h in proc_hints):
+                    ref = f"{src_paths[d].name} p.{i + 1}"
+                    proc_pages.setdefault(label, []).append(ref)
+        order = suggest_order(docs, profile)
         classes = classify_documents(docs)
         for (d, i), cls in classes.items():
             if cls == "anulado":
@@ -1006,8 +661,16 @@ def process_folder(
             )
         present = {c for c in classes.values() if c != "anulado"}
         missing = [
-            label for cls, label in _REQUIRED_DOCS if cls not in present
+            label for cls, label in profile.required
+            if cls not in present
         ]
+        # obrigatorios condicionais do perfil (ex.: termo de anestesia
+        # so e exigido na retirada de placa/parafusos, nao na de fio)
+        for cls, label, cond_hints in profile.conditional:
+            if cls in present:
+                continue
+            if any(h in t for t in norms_list for h in cond_hints):
+                missing.append(label)
         audit = audit_patient(docs, ref_from_folder(folder.name))
         for s in audit["suspects"]:
             s = dict(s)
@@ -1054,7 +717,20 @@ def process_folder(
     finally:
         for doc in docs:
             doc.close()
-    return output, len(order), suspects, excluded, skipped, missing
+    return {
+        "output": output,
+        "pages": len(order),
+        "suspects": suspects,
+        "excluded": excluded,
+        "skipped": skipped,
+        "missing": missing,
+        "profile": profile,
+        # {tipo: [refs das paginas]} — so presente quando dois tipos
+        # de procedimento aparecem no mesmo dossie
+        "proc_divergence": (
+            proc_pages if len(proc_pages) > 1 else None
+        ),
+    }
 
 
 def organize_batch(
@@ -1108,20 +784,20 @@ def organize_batch(
             entry.update(status="skip", detail="sem arquivos PDF")
         else:
             try:
-                (
-                    out,
-                    pages,
-                    suspects,
-                    excluded,
-                    skipped,
-                    missing,
-                ) = process_folder(
+                res = process_folder(
                     folder, pdfs, rename_folder=(folder != Path(root))
                 )
-                entry.update(status="ok", pages=pages, output=out.name,
+                out = res["output"]
+                profile = res["profile"]
+                entry.update(status="ok", pages=res["pages"],
+                             output=out.name,
                              folder_path=str(out.parent),
-                             suspects=suspects, excluded=excluded,
-                             skipped=skipped, missing=missing)
+                             suspects=res["suspects"],
+                             excluded=res["excluded"],
+                             skipped=res["skipped"],
+                             missing=res["missing"],
+                             kind=profile.key, kind_label=profile.label,
+                             proc_divergence=res["proc_divergence"])
             except Exception as exc:  # noqa: BLE001 - segue para a proxima pasta
                 entry.update(status="error", detail=str(exc))
         results.append(entry)
